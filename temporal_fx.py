@@ -926,7 +926,15 @@ EFFECTS = {
 }
 
 
-def run_effect(input_path, effect_name, n_override, output_path, decay, step, quality="low", pre_eq=False):
+def apply_post_eq(frame, clip_limit):
+    """Apply CLAHE histogram equalization to restore contrast after processing."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def run_effect(input_path, effect_name, n_override, output_path, decay, step, quality="low", pre_eq=False, post_eq=None):
     fn, default_n, desc = EFFECTS[effect_name]
     n = n_override if n_override is not None else default_n
 
@@ -936,6 +944,8 @@ def run_effect(input_path, effect_name, n_override, output_path, decay, step, qu
         print(f"  n = {n}")
     if pre_eq:
         print(f"  pre-eq = on (CLAHE on input frames)")
+    if post_eq is not None:
+        print(f"  post-eq = on (CLAHE clip_limit={post_eq:.1f})")
     if effect_name == "decay":
         print(f"  decay = {decay}")
     if effect_name == "strobe":
@@ -950,6 +960,10 @@ def run_effect(input_path, effect_name, n_override, output_path, decay, step, qu
 
     print(f"  Processing {effect_name}...")
     out_frames = fn(frames, n=n, decay=decay, step=step, quality=quality)
+
+    if post_eq is not None:
+        print(f"  Applying post-EQ (CLAHE clip_limit={post_eq:.1f})...")
+        out_frames = [apply_post_eq(f, post_eq) for f in out_frames]
 
     if output_path is None:
         p = Path(input_path)
@@ -979,9 +993,11 @@ Effect-specific options:
                         medium — balanced (pyr_scale=0.5, levels=5, winsize=21, iter=5, Gaussian)
                         high   — best (pyr_scale=0.4, levels=7, winsize=31, iter=10, Gaussian)
 
-Pre-processing:
+Pre/post-processing:
   --pre-eq            Apply CLAHE histogram equalization to all input frames
                       before any effect processing (expands dynamic range)
+  --post-eq CLIP      Apply CLAHE equalization after processing to restore
+                      contrast (clip limit, e.g. 2.0; higher = stronger)
 
 Examples:
   %(prog)s video.mp4 -e echo
@@ -990,6 +1006,7 @@ Examples:
   %(prog)s video.mp4 -e decay --decay 0.85
   %(prog)s video.mp4 -e strobe --step 8
   %(prog)s video.mp4 -e brightest -n 30 --pre-eq
+  %(prog)s video.mp4 -e echo -n 60 --post-eq 2.0
   %(prog)s video.mp4 -e flow-farneback -q high
   %(prog)s video.mp4 -e flow-raft
   %(prog)s video.mp4 -e all
@@ -1014,10 +1031,13 @@ Examples:
                         help="Quality preset for flow-farneback (default: low)")
     parser.add_argument("--pre-eq", action="store_true",
                         help="Apply CLAHE equalization to input frames before processing")
+    parser.add_argument("--post-eq", type=float, default=None, metavar="CLIP",
+                        help="Apply CLAHE equalization after processing to restore contrast "
+                             "(clip limit, e.g. 2.0; higher = stronger)")
     args = parser.parse_args()
 
     if args.effect == "all":
         for name in EFFECTS:
-            run_effect(args.input, name, args.frames, None, args.decay, args.step, args.quality, args.pre_eq)
+            run_effect(args.input, name, args.frames, None, args.decay, args.step, args.quality, args.pre_eq, args.post_eq)
     else:
-        run_effect(args.input, args.effect, args.frames, args.output, args.decay, args.step, args.quality, args.pre_eq)
+        run_effect(args.input, args.effect, args.frames, args.output, args.decay, args.step, args.quality, args.pre_eq, args.post_eq)
