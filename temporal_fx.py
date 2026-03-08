@@ -9,6 +9,8 @@ import numpy as np
 import argparse
 import subprocess
 import sys
+import multiprocessing as mp
+from multiprocessing import shared_memory
 import time
 from pathlib import Path
 
@@ -30,6 +32,435 @@ def progress_bar(current, total, elapsed, bar_width=40):
     elapsed_str = f"{elapsed_mins}m{elapsed_secs:02d}s" if elapsed_mins else f"{elapsed_secs}s"
 
     print(f"\r  {bar} {pct:5.1f}%  {current}/{total}  elapsed {elapsed_str}  eta {eta_str}   ", end="", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Generic shared-memory multicore processing (used by parallelizable effects)
+# ---------------------------------------------------------------------------
+
+_par = {}
+
+
+def _init_parallel(in_name, out_name, shape, dtype_str, counter, effect, n, extra):
+    _par['in_shm'] = shared_memory.SharedMemory(name=in_name)
+    _par['out_shm'] = shared_memory.SharedMemory(name=out_name)
+    dt = np.dtype(dtype_str)
+    _par['frames'] = np.ndarray(shape, dtype=dt, buffer=_par['in_shm'].buf)
+    _par['output'] = np.ndarray(shape, dtype=dt, buffer=_par['out_shm'].buf)
+    _par['counter'] = counter
+    _par['effect'] = effect
+    _par['n'] = n
+    _par['extra'] = extra if extra else {}
+
+
+def _process_one(i):
+    _PARALLEL_WORKERS[_par['effect']](i)
+    with _par['counter'].get_lock():
+        _par['counter'].value += 1
+
+
+def _parallel_effect(frames, n, effect, cores, extra=None):
+    """Run a parallelizable effect across multiple cores using shared memory."""
+    total = len(frames)
+    h, w, c = frames[0].shape
+    shape = (total, h, w, c)
+    dtype = np.uint8
+    frame_bytes = int(np.prod(shape))
+
+    in_shm = shared_memory.SharedMemory(create=True, size=frame_bytes)
+    out_shm = shared_memory.SharedMemory(create=True, size=frame_bytes)
+
+    try:
+        in_arr = np.ndarray(shape, dtype=dtype, buffer=in_shm.buf)
+        for idx, f in enumerate(frames):
+            in_arr[idx] = f
+
+        counter = mp.Value('i', 0)
+        use_cores = min(cores, total)
+
+        t0 = time.time()
+        pool = mp.Pool(
+            use_cores,
+            initializer=_init_parallel,
+            initargs=(in_shm.name, out_shm.name, shape,
+                      np.dtype(dtype).str, counter, effect, n, extra),
+        )
+
+        result = pool.map_async(_process_one, range(total))
+
+        while not result.ready():
+            progress_bar(counter.value, total, time.time() - t0)
+            time.sleep(0.1)
+
+        result.get()
+        pool.close()
+        pool.join()
+
+        progress_bar(total, total, time.time() - t0)
+        print()
+
+        out_arr = np.ndarray(shape, dtype=dtype, buffer=out_shm.buf)
+        out_frames = [out_arr[i].copy() for i in range(total)]
+
+    finally:
+        in_shm.close()
+        in_shm.unlink()
+        out_shm.close()
+        out_shm.unlink()
+
+    return out_frames
+
+
+# --- Per-effect parallel worker functions ---
+
+def _pw_echo(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    start = max(0, i - n + 1)
+    acc = np.zeros(frames.shape[1:], dtype=np.float64)
+    for fi in range(start, i + 1):
+        acc += frames[fi].astype(np.float64)
+    acc /= (i + 1 - start)
+    output[i] = np.clip(acc, 0, 255).astype(np.uint8)
+
+
+def _pw_gaussian(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    weights = np.array(_par['extra']['weights'])
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    w_start = start - (i - half)
+    w = weights[w_start:w_start + (end - start)]
+    w = w / w.sum()
+    acc = np.zeros(frames.shape[1:], dtype=np.float64)
+    for j, fi in enumerate(range(start, end)):
+        acc += frames[fi].astype(np.float64) * w[j]
+    output[i] = np.clip(acc, 0, 255).astype(np.uint8)
+
+
+def _pw_slit_scan(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    height = frames.shape[1]
+    for row in range(height):
+        offset = int((row / height - 0.5) * n)
+        src_idx = min(max(i + offset, 0), total - 1)
+        output[i, row] = frames[src_idx, row]
+
+
+def _pw_median(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    stack = frames[start:end].astype(np.uint8)
+    output[i] = np.median(stack, axis=0).astype(np.uint8)
+
+
+def _pw_time_ramp(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    win = max(1, int(1 + (n - 1) * i / max(1, total - 1)))
+    start = max(0, i - win + 1)
+    acc = np.zeros(frames.shape[1:], dtype=np.float64)
+    for fi in range(start, i + 1):
+        acc += frames[fi].astype(np.float64)
+    acc /= (i + 1 - start)
+    output[i] = np.clip(acc, 0, 255).astype(np.uint8)
+
+
+def _pw_strobe(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    step = _par['extra']['step']
+    indices = list(range(i, max(i - n * step, -1), -step))
+    indices = [idx for idx in indices if 0 <= idx < total]
+    if not indices:
+        indices = [i]
+    acc = np.zeros(frames.shape[1:], dtype=np.float64)
+    for idx in indices:
+        acc += frames[idx].astype(np.float64)
+    acc /= len(indices)
+    output[i] = np.clip(acc, 0, 255).astype(np.uint8)
+
+
+def _pw_ping_pong(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    acc = np.zeros(frames.shape[1:], dtype=np.float64)
+    count = 0
+    for offset in range(-half, half + 1):
+        fwd = i + offset
+        rev = i - offset
+        for idx in (fwd, rev):
+            if 0 <= idx < total:
+                acc += frames[idx].astype(np.float64)
+                count += 1
+    acc /= max(count, 1)
+    output[i] = np.clip(acc, 0, 255).astype(np.uint8)
+
+
+def _pw_rolling_shutter(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    height = frames.shape[1]
+    for row in range(height):
+        offset = int(row / height * n)
+        src_idx = min(max(i + offset, 0), total - 1)
+        output[i, row] = frames[src_idx, row]
+
+
+def _pw_brightest(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    bright = np.max(frames[start:end], axis=0)
+    output[i] = cv2.addWeighted(bright, 0.85, frames[i], 0.15, 0)
+
+
+def _pw_darkest(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    dark = np.min(frames[start:end], axis=0)
+    output[i] = cv2.addWeighted(dark, 0.85, frames[i], 0.15, 0)
+
+
+def _pw_temporal_gradient(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    stack = frames[start:end].astype(np.float64)
+    std = np.std(stack, axis=0)
+    magnitude = np.max(std, axis=2).astype(np.float32)
+    mag_max = magnitude.max()
+    if mag_max > 0:
+        magnitude = (magnitude / mag_max * 255).astype(np.uint8)
+    else:
+        magnitude = magnitude.astype(np.uint8)
+    output[i] = cv2.applyColorMap(magnitude, cv2.COLORMAP_TURBO)
+
+
+def _pw_brightest_eq(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    bright = np.max(frames[start:end], axis=0)
+    output[i] = equalize_frame(bright)
+
+
+def _pw_darkest_eq(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    dark = np.min(frames[start:end], axis=0)
+    output[i] = equalize_frame(dark)
+
+
+def _pw_brightest_edge(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    bright = np.max(frames[start:end], axis=0)
+    eq = equalize_frame(bright)
+    gray = cv2.cvtColor(eq, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    eq[edges > 0] = 255
+    output[i] = eq
+
+
+def _pw_darkest_edge(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    dark = np.min(frames[start:end], axis=0)
+    eq = equalize_frame(dark)
+    gray = cv2.cvtColor(eq, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    eq[edges > 0] = 255
+    output[i] = eq
+
+
+def _pw_bitwise_or(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    acc = frames[start].copy()
+    for j in range(start + 1, end):
+        acc = cv2.bitwise_or(acc, frames[j])
+    output[i] = acc
+
+
+def _pw_bitwise_and(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    acc = frames[start].copy()
+    for j in range(start + 1, end):
+        acc = cv2.bitwise_and(acc, frames[j])
+    output[i] = acc
+
+
+def _pw_bitwise_nor(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    acc = frames[start].copy()
+    for j in range(start + 1, end):
+        acc = cv2.bitwise_or(acc, frames[j])
+    output[i] = cv2.bitwise_not(acc)
+
+
+def _pw_bitwise_nor_eq(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    acc = frames[start].copy()
+    for j in range(start + 1, end):
+        acc = cv2.bitwise_or(acc, frames[j])
+    output[i] = equalize_frame(cv2.bitwise_not(acc))
+
+
+def _pw_screen(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    log_sum = np.zeros(frames.shape[1:], dtype=np.float32)
+    for fi in range(start, end):
+        log_sum += np.log((1.0 - frames[fi].astype(np.float32) / 255.0) + 1e-10)
+    out = (1.0 - np.exp(log_sum)) * 255
+    output[i] = out.clip(0, 255).astype(np.uint8)
+
+
+def _pw_multiply(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    count = end - start
+    log_sum = np.zeros(frames.shape[1:], dtype=np.float32)
+    for fi in range(start, end):
+        log_sum += np.log(frames[fi].astype(np.float32) / 255.0 + 1e-10)
+    out = np.exp(log_sum / count) * 255
+    output[i] = out.clip(0, 255).astype(np.uint8)
+
+
+def _pw_temporal_variance(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    total = frames.shape[0]
+    half = n // 2
+    start = max(0, i - half)
+    end = min(total, i + half + 1)
+    grays = []
+    for fi in range(start, end):
+        grays.append(cv2.cvtColor(frames[fi], cv2.COLOR_BGR2GRAY).astype(np.float32))
+    stack = np.stack(grays, axis=0)
+    std = np.std(stack, axis=0)
+    std_max = std.max()
+    if std_max > 0:
+        norm = (std / std_max * 255).astype(np.uint8)
+    else:
+        norm = np.zeros(std.shape, dtype=np.uint8)
+    output[i] = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+
+
+def _pw_hue_trails(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    max_samples = 12
+    start = max(0, i - n + 1)
+    count = i - start + 1
+    if count > max_samples:
+        indices = np.linspace(start, i, max_samples, dtype=int)
+    else:
+        indices = list(range(start, i + 1))
+    acc = np.zeros(frames.shape[1:], dtype=np.float32)
+    w_sum = 0.0
+    num = len(indices)
+    for k, idx in enumerate(indices):
+        age = num - 1 - k
+        hsv = cv2.cvtColor(frames[idx].copy(), cv2.COLOR_BGR2HSV)
+        hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + age * 8) % 180).astype(np.uint8)
+        w = 1.0 / (1 + age * 0.4)
+        acc += cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR).astype(np.float32) * w
+        w_sum += w
+    acc /= w_sum
+    output[i] = acc.clip(0, 255).astype(np.uint8)
+
+
+def _pw_time_mosaic(i):
+    frames, output, n = _par['frames'], _par['output'], _par['n']
+    h, w = frames.shape[1], frames.shape[2]
+    grid = 8
+    tile_h, tile_w = h // grid, w // grid
+    start = max(0, i - n + 1)
+    window_len = i - start + 1
+    out = np.zeros(frames.shape[1:], dtype=np.uint8)
+    for gy in range(grid):
+        for gx in range(grid):
+            idx = (gy * grid + gx) % window_len
+            src = start + idx
+            y0 = gy * tile_h
+            y1 = (gy + 1) * tile_h if gy < grid - 1 else h
+            x0 = gx * tile_w
+            x1 = (gx + 1) * tile_w if gx < grid - 1 else w
+            out[y0:y1, x0:x1] = frames[src][y0:y1, x0:x1]
+    output[i] = out
+
+
+_PARALLEL_WORKERS = {
+    "echo": _pw_echo,
+    "gaussian": _pw_gaussian,
+    "slit-scan": _pw_slit_scan,
+    "median": _pw_median,
+    "time-ramp": _pw_time_ramp,
+    "strobe": _pw_strobe,
+    "ping-pong": _pw_ping_pong,
+    "rolling-shutter": _pw_rolling_shutter,
+    "brightest": _pw_brightest,
+    "darkest": _pw_darkest,
+    "temporal-gradient": _pw_temporal_gradient,
+    "brightest-eq": _pw_brightest_eq,
+    "darkest-eq": _pw_darkest_eq,
+    "brightest-edge": _pw_brightest_edge,
+    "darkest-edge": _pw_darkest_edge,
+    "bitwise-or": _pw_bitwise_or,
+    "bitwise-and": _pw_bitwise_and,
+    "bitwise-nor": _pw_bitwise_nor,
+    "bitwise-nor-eq": _pw_bitwise_nor_eq,
+    "screen": _pw_screen,
+    "multiply": _pw_multiply,
+    "temporal-variance": _pw_temporal_variance,
+    "hue-trails": _pw_hue_trails,
+    "time-mosaic": _pw_time_mosaic,
+}
 
 
 def load_frames(input_path):
@@ -96,8 +527,10 @@ def write_and_mux(out_frames, fps, width, height, output_path, input_path):
 # Effect implementations
 # ---------------------------------------------------------------------------
 
-def fx_echo(frames, n, **kw):
+def fx_echo(frames, n, cores=1, **kw):
     """Blend only previous N frames (motion trails)."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "echo", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -114,14 +547,20 @@ def fx_echo(frames, n, **kw):
     return result
 
 
-def fx_gaussian(frames, n, **kw):
+def fx_gaussian(frames, n, cores=1, sigma=None, **kw):
     """Gaussian-weighted blend across N frames — bell curve falloff from center."""
+    if sigma is None:
+        sigma = n / 4.0
+    if cores > 1:
+        half = n // 2
+        full_size = 2 * half + 1
+        kernel = np.exp(-0.5 * (np.arange(full_size) - half) ** 2 / (sigma ** 2))
+        return _parallel_effect(frames, n, "gaussian", cores,
+                                extra={'weights': kernel.tolist()})
     total = len(frames)
     result = []
     t0 = time.time()
     half = n // 2
-    # Precompute Gaussian kernel (sigma = n/4 gives good falloff)
-    sigma = n / 4.0
     full_size = 2 * half + 1
     kernel = np.exp(-0.5 * (np.arange(full_size) - half) ** 2 / (sigma ** 2))
     for i in range(total):
@@ -141,8 +580,10 @@ def fx_gaussian(frames, n, **kw):
     return result
 
 
-def fx_slit_scan(frames, n, **kw):
+def fx_slit_scan(frames, n, cores=1, **kw):
     """Each row of pixels comes from a different frame in time."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "slit-scan", cores)
     total = len(frames)
     height = frames[0].shape[0]
     result = []
@@ -175,8 +616,10 @@ def fx_diff(frames, n=None, **kw):
     return result
 
 
-def fx_median(frames, n, **kw):
+def fx_median(frames, n, cores=1, **kw):
     """Median pixel across N frames (removes moving objects)."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "median", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -208,8 +651,10 @@ def fx_decay(frames, n=None, decay=0.92, **kw):
     return result
 
 
-def fx_time_ramp(frames, n, **kw):
+def fx_time_ramp(frames, n, cores=1, **kw):
     """Blend window grows from 1 to N over the clip duration."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "time-ramp", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -228,8 +673,10 @@ def fx_time_ramp(frames, n, **kw):
     return result
 
 
-def fx_strobe(frames, n, step=4, **kw):
+def fx_strobe(frames, n, step=4, cores=1, **kw):
     """Blend every Kth frame across a wider time span."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "strobe", cores, extra={'step': step})
     total = len(frames)
     result = []
     t0 = time.time()
@@ -248,8 +695,10 @@ def fx_strobe(frames, n, step=4, **kw):
     return result
 
 
-def fx_ping_pong(frames, n, **kw):
+def fx_ping_pong(frames, n, cores=1, **kw):
     """Average forward + time-reversed frames together."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "ping-pong", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -273,8 +722,10 @@ def fx_ping_pong(frames, n, **kw):
     return result
 
 
-def fx_rolling_shutter(frames, n, **kw):
+def fx_rolling_shutter(frames, n, cores=1, **kw):
     """Each scanline offset by 1 frame in time (rolling shutter simulation)."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "rolling-shutter", cores)
     total = len(frames)
     height = frames[0].shape[0]
     result = []
@@ -292,8 +743,10 @@ def fx_rolling_shutter(frames, n, **kw):
     return result
 
 
-def fx_brightest(frames, n, **kw):
+def fx_brightest(frames, n, cores=1, **kw):
     """Keep brightest pixel across N frames (light trails)."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "brightest", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -309,8 +762,10 @@ def fx_brightest(frames, n, **kw):
     return result
 
 
-def fx_darkest(frames, n, **kw):
+def fx_darkest(frames, n, cores=1, **kw):
     """Keep darkest pixel across N frames."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "darkest", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -326,8 +781,10 @@ def fx_darkest(frames, n, **kw):
     return result
 
 
-def fx_temporal_gradient(frames, n, **kw):
+def fx_temporal_gradient(frames, n, cores=1, **kw):
     """Map per-pixel temporal change to a color gradient."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "temporal-gradient", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -354,16 +811,18 @@ def fx_temporal_gradient(frames, n, **kw):
     return result
 
 
-def equalize_frame(frame):
+def equalize_frame(frame, clip_limit=3.0):
     """Apply CLAHE histogram equalization on the L channel in LAB space."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
     lab[..., 0] = clahe.apply(lab[..., 0])
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def fx_brightest_eq(frames, n, **kw):
+def fx_brightest_eq(frames, n, cores=1, **kw):
     """Keep brightest pixel across N frames + CLAHE histogram equalization."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "brightest-eq", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -379,8 +838,10 @@ def fx_brightest_eq(frames, n, **kw):
     return result
 
 
-def fx_darkest_eq(frames, n, **kw):
+def fx_darkest_eq(frames, n, cores=1, **kw):
     """Keep darkest pixel across N frames + CLAHE histogram equalization."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "darkest-eq", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -396,8 +857,10 @@ def fx_darkest_eq(frames, n, **kw):
     return result
 
 
-def fx_brightest_edge(frames, n, **kw):
+def fx_brightest_edge(frames, n, cores=1, **kw):
     """Brightest pixel + CLAHE equalization with Canny edge overlay."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "brightest-edge", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -417,8 +880,10 @@ def fx_brightest_edge(frames, n, **kw):
     return result
 
 
-def fx_darkest_edge(frames, n, **kw):
+def fx_darkest_edge(frames, n, cores=1, **kw):
     """Darkest pixel + CLAHE equalization with Canny edge overlay."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "darkest-edge", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -438,8 +903,10 @@ def fx_darkest_edge(frames, n, **kw):
     return result
 
 
-def fx_bitwise_or(frames, n, **kw):
+def fx_bitwise_or(frames, n, cores=1, **kw):
     """Bitwise OR across N consecutive frames — accumulates all lit pixels."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "bitwise-or", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -456,8 +923,10 @@ def fx_bitwise_or(frames, n, **kw):
     return result
 
 
-def fx_bitwise_and(frames, n, **kw):
+def fx_bitwise_and(frames, n, cores=1, **kw):
     """Bitwise AND across N consecutive frames — keeps only persistent pixels."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "bitwise-and", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -474,8 +943,10 @@ def fx_bitwise_and(frames, n, **kw):
     return result
 
 
-def fx_bitwise_nor(frames, n, **kw):
+def fx_bitwise_nor(frames, n, cores=1, **kw):
     """Bitwise NOR across N consecutive frames — inverse of OR, keeps unlit pixels."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "bitwise-nor", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -492,8 +963,10 @@ def fx_bitwise_nor(frames, n, **kw):
     return result
 
 
-def fx_bitwise_nor_eq(frames, n, **kw):
+def fx_bitwise_nor_eq(frames, n, cores=1, **kw):
     """Bitwise NOR across N frames + CLAHE histogram equalization."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "bitwise-nor-eq", cores)
     total = len(frames)
     result = []
     t0 = time.time()
@@ -524,9 +997,11 @@ def fx_bitwise_xor(frames, n=None, **kw):
     return result
 
 
-def fx_screen(frames, n, **kw):
+def fx_screen(frames, n, cores=1, **kw):
     """Screen blend across N frames — combines light, like double-exposure film.
     Screen: 1 - product(1 - f_i/255). Uses rolling log-sum for speed."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "screen", cores)
     total = len(frames)
     # Precompute log(1 - f/255) for each frame
     log_inv = [np.log((1.0 - frames[i].astype(np.float32) / 255.0) + 1e-10) for i in range(total)]
@@ -555,9 +1030,11 @@ def fx_screen(frames, n, **kw):
     return result
 
 
-def fx_multiply(frames, n, **kw):
+def fx_multiply(frames, n, cores=1, **kw):
     """Multiply blend across N frames — combines shadows, darkens overlaps.
     Normalized: product^(1/count). Uses rolling log-sum for speed."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "multiply", cores)
     total = len(frames)
     # Precompute log(f/255) for each frame
     log_f = [np.log(frames[i].astype(np.float32) / 255.0 + 1e-10) for i in range(total)]
@@ -585,8 +1062,10 @@ def fx_multiply(frames, n, **kw):
     return result
 
 
-def fx_temporal_variance(frames, n, **kw):
+def fx_temporal_variance(frames, n, cores=1, **kw):
     """Per-pixel temporal standard deviation mapped to TURBO colormap."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "temporal-variance", cores)
     total = len(frames)
     # Pre-compute grayscale frames
     grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) for f in frames]
@@ -609,9 +1088,11 @@ def fx_temporal_variance(frames, n, **kw):
     return result
 
 
-def fx_hue_trails(frames, n, **kw):
+def fx_hue_trails(frames, n, cores=1, **kw):
     """Echo with progressive hue shift — rainbow-colored motion trails.
     Samples up to 12 frames from the window for speed."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "hue-trails", cores)
     total = len(frames)
     max_samples = 12
     result = []
@@ -641,8 +1122,10 @@ def fx_hue_trails(frames, n, **kw):
     return result
 
 
-def fx_time_mosaic(frames, n, **kw):
+def fx_time_mosaic(frames, n, cores=1, **kw):
     """Grid of tiles, each from a different moment in the N-frame window."""
+    if cores > 1:
+        return _parallel_effect(frames, n, "time-mosaic", cores)
     total = len(frames)
     h, w = frames[0].shape[:2]
     grid = 8
@@ -934,7 +1417,7 @@ def apply_post_eq(frame, clip_limit):
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
-def run_effect(input_path, effect_name, n_override, output_path, decay, step, quality="low", pre_eq=False, post_eq=None):
+def run_effect(input_path, effect_name, n_override, output_path, decay, step, quality="low", pre_eq=None, post_eq=None, cores=1, sigma=None):
     fn, default_n, desc = EFFECTS[effect_name]
     n = n_override if n_override is not None else default_n
 
@@ -942,28 +1425,40 @@ def run_effect(input_path, effect_name, n_override, output_path, decay, step, qu
     print(f"Effect: {effect_name} — {desc}")
     if n is not None:
         print(f"  n = {n}")
-    if pre_eq:
-        print(f"  pre-eq = on (CLAHE on input frames)")
+    if pre_eq is not None:
+        print(f"  pre-eq = on (CLAHE clip_limit={pre_eq:.1f})")
     if post_eq is not None:
         print(f"  post-eq = on (CLAHE clip_limit={post_eq:.1f})")
     if effect_name == "decay":
         print(f"  decay = {decay}")
     if effect_name == "strobe":
         print(f"  step = {step}")
+    if sigma is not None and effect_name == "gaussian":
+        print(f"  sigma = {sigma}")
+    if cores > 1:
+        print(f"  cores = {cores}")
     print(f"Input: {input_path}")
 
     frames, fps, width, height = load_frames(input_path)
 
-    if pre_eq:
-        print(f"  Equalizing {len(frames)} input frames...")
-        frames = [equalize_frame(f) for f in frames]
+    if pre_eq is not None:
+        print(f"  Equalizing {len(frames)} input frames (clip_limit={pre_eq:.1f})...")
+        if cores > 1:
+            with mp.Pool(min(cores, len(frames))) as pool:
+                frames = pool.starmap(apply_post_eq, [(f, pre_eq) for f in frames])
+        else:
+            frames = [apply_post_eq(f, pre_eq) for f in frames]
 
     print(f"  Processing {effect_name}...")
-    out_frames = fn(frames, n=n, decay=decay, step=step, quality=quality)
+    out_frames = fn(frames, n=n, decay=decay, step=step, quality=quality, cores=cores, sigma=sigma)
 
     if post_eq is not None:
         print(f"  Applying post-EQ (CLAHE clip_limit={post_eq:.1f})...")
-        out_frames = [apply_post_eq(f, post_eq) for f in out_frames]
+        if cores > 1:
+            with mp.Pool(min(cores, len(out_frames))) as pool:
+                out_frames = pool.starmap(apply_post_eq, [(f, post_eq) for f in out_frames])
+        else:
+            out_frames = [apply_post_eq(f, post_eq) for f in out_frames]
 
     if output_path is None:
         p = Path(input_path)
@@ -988,24 +1483,36 @@ if __name__ == "__main__":
 Effect-specific options:
   --decay FLOAT       Decay factor for 'decay' effect (default: 0.92)
   --step  INT         Step size for 'strobe' effect (default: 4)
+  --sigma FLOAT       Gaussian sigma for 'gaussian' effect (default: n/4)
+                        Smaller = sharper peak, larger = flatter
   -q, --quality LEVEL Quality preset for 'flow-farneback' (default: low)
                         low    — fast (pyr_scale=0.5, levels=3, winsize=15, iter=3)
                         medium — balanced (pyr_scale=0.5, levels=5, winsize=21, iter=5, Gaussian)
                         high   — best (pyr_scale=0.4, levels=7, winsize=31, iter=10, Gaussian)
 
 Pre/post-processing:
-  --pre-eq            Apply CLAHE histogram equalization to all input frames
-                      before any effect processing (expands dynamic range)
+  --pre-eq CLIP       Apply CLAHE histogram equalization to all input frames
+                      before any effect processing (clip limit, e.g. 2.0)
   --post-eq CLIP      Apply CLAHE equalization after processing to restore
                       contrast (clip limit, e.g. 2.0; higher = stronger)
+
+Parallelism:
+  --cores N           Number of CPU cores for parallel processing (default: 4)
+                      Most effects support shared-memory multicore processing.
+                      Not parallelized: decay, feedback (sequential accumulation),
+                      flow-dis, flow-farneback, flow-raft, motion-streak (optical flow),
+                      diff, bitwise-xor (trivially fast consecutive-frame ops).
+                      pre-eq and post-eq are also parallelized.
 
 Examples:
   %(prog)s video.mp4 -e echo
   %(prog)s video.mp4 -e echo -n 60
+  %(prog)s video.mp4 -e echo -n 30 --cores 4
   %(prog)s video.mp4 -e gaussian -n 40
+  %(prog)s video.mp4 -e gaussian -n 30 --cores 4 --sigma 5.0
   %(prog)s video.mp4 -e decay --decay 0.85
   %(prog)s video.mp4 -e strobe --step 8
-  %(prog)s video.mp4 -e brightest -n 30 --pre-eq
+  %(prog)s video.mp4 -e brightest -n 30 --pre-eq 2.0
   %(prog)s video.mp4 -e echo -n 60 --post-eq 2.0
   %(prog)s video.mp4 -e flow-farneback -q high
   %(prog)s video.mp4 -e flow-raft
@@ -1026,18 +1533,24 @@ Examples:
                         help="Step size for 'strobe' effect (default: 4)")
     parser.add_argument("-o", "--output", default=None,
                         help="Output video file path")
+    parser.add_argument("--sigma", type=float, default=None,
+                        help="Gaussian sigma for 'gaussian' effect (default: n/4). "
+                             "Smaller = sharper peak, larger = flatter")
     parser.add_argument("--quality", "-q", default="low",
                         choices=["low", "medium", "high"],
                         help="Quality preset for flow-farneback (default: low)")
-    parser.add_argument("--pre-eq", action="store_true",
-                        help="Apply CLAHE equalization to input frames before processing")
+    parser.add_argument("--pre-eq", type=float, default=None, metavar="CLIP",
+                        help="Apply CLAHE equalization to input frames before processing "
+                             "(clip limit, e.g. 2.0; higher = stronger)")
     parser.add_argument("--post-eq", type=float, default=None, metavar="CLIP",
                         help="Apply CLAHE equalization after processing to restore contrast "
                              "(clip limit, e.g. 2.0; higher = stronger)")
+    parser.add_argument("--cores", type=int, default=4,
+                        help="Number of CPU cores for parallel processing (default: 4)")
     args = parser.parse_args()
 
     if args.effect == "all":
         for name in EFFECTS:
-            run_effect(args.input, name, args.frames, None, args.decay, args.step, args.quality, args.pre_eq, args.post_eq)
+            run_effect(args.input, name, args.frames, None, args.decay, args.step, args.quality, args.pre_eq, args.post_eq, args.cores, args.sigma)
     else:
-        run_effect(args.input, args.effect, args.frames, args.output, args.decay, args.step, args.quality, args.pre_eq, args.post_eq)
+        run_effect(args.input, args.effect, args.frames, args.output, args.decay, args.step, args.quality, args.pre_eq, args.post_eq, args.cores, args.sigma)
