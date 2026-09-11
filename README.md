@@ -8,6 +8,18 @@ Tools for processing video frames over time.
 
 The two main tools compose well: slow footage down with `retime.py`, run a temporal effect over the extra frames, then speed it back up (`--factor 0.5` and below speed up).
 
+## Example results
+
+The [`examples/`](examples/) folder holds seven short H.265 clips, one per technique, with [`examples/README.md`](examples/README.md) mapping each movie to the exact command that produced it:
+
+1. [Trails ahead of the subject](examples/01_trails-ahead_anchor0.mp4) — echo with `--anchor 0`
+2. [Anchor swing](examples/02_anchor-swing_slowed.mp4) — echo anchor animated 1 → 0, trails crossing from behind to ahead (slowed stage)
+3. [Eased breathing echo](examples/03_eased-breathing-echo_roundtrip.mp4) — 3.4x eased slow-down → anchor-swing echo → constant speed-up
+4. [Look stack on echo](examples/04_look-stack_echo.mp4) — edge re-injection, sharpen, orig-mix, and CLAHE restore over heavy blending
+5. [Look stack on gaussian](examples/05_look-stack_gaussian_2x-sandwich.mp4) — same grade in a 2x retime sandwich (A/B against 4)
+6. [slowEcho round trip](examples/06_slowecho_3.4x-eased-roundtrip.mp4) — deepest retime with the full look stack
+7. [Multi-parameter choreography](examples/07_multi-param-choreography.mp4) — four parameters keyframed against one dance clip
+
 ## Requirements
 
 - Python 3.10+
