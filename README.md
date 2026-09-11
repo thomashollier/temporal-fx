@@ -1,32 +1,131 @@
 # Temporal Video Effects Suite
 
-31 temporal effects for video, processing frames over time to create unique visual results.
+Tools for processing video frames over time.
+
+- **`temporal_fx.py`** — the effect engine. Applies one of 31 temporal effects (motion trails, slit-scan, bitwise blends, optical-flow visualization, …) to a video. Basic use: `python3 temporal_fx.py video.mp4 -e echo`. Almost every numeric option can be animated over time with keyframes or math expressions (see [Animated parameters](#animated-parameters-kcurve)).
+- **`retime.py`** — optical-flow retimer. Slows down (or speeds up) a video by synthesizing in-between frames with dense optical flow, instead of duplicating or dropping frames. Basic use: `python3 retime.py video.mp4 --factor 2` for 50% speed.
+- **`batch_random.py`** — batch driver that generates 50 randomized effect jobs from videos in `source/` and runs them in parallel through `temporal_fx.py`.
+
+The two main tools compose well: slow footage down with `retime.py`, run a temporal effect over the extra frames, then speed it back up (`--factor 0.5` and below speed up).
 
 ## Requirements
 
 - Python 3.10+
 - OpenCV (`pip install opencv-python`)
 - NumPy
-- FFmpeg (on PATH, for H.264 re-encoding and audio muxing)
-- PyTorch + torchvision >= 0.22.0 (only needed for `flow-raft`)
+- `kcurve` package (animated parameter curves — install it, or place a `kcurve/` checkout next to the scripts)
+- FFmpeg (on PATH, for H.264 re-encoding and audio muxing; scripts still work without it, skipping that step)
+- PyTorch + torchvision >= 0.22.0 (only needed for the RAFT flow backend / `flow-raft` effect)
 
-## Usage
+---
+
+# temporal_fx.py
 
 ```
 python3 temporal_fx.py <input_video> -e <effect> [options]
 ```
 
-### Options
+## Options
+
+### Core
 
 | Flag | Description |
 |---|---|
-| `-e, --effect` | Effect name or `all` (required) |
-| `-n, --frames` | Temporal window size (overrides effect default) |
-| `-o, --output` | Output file path (auto-generated if omitted) |
-| `--decay` | Decay factor for `decay` effect (default: 0.92) |
-| `--step` | Step size for `strobe` effect (default: 4) |
+| `-e, --effect` | Effect name or `all` to run every effect (required) |
+| `-n, --frames` | Temporal window size in frames (overrides the effect's default). Animatable. |
+| `-o, --output` | Output file path (auto-generated next to the input if omitted) |
+| `--reverse` | Blend with *following* frames instead of previous (reverses input, processes, reverses output) |
+| `--hflip` | Mirror frames horizontally before processing |
+| `--no-audio` | Skip muxing audio from the source |
+
+### Effect-specific
+
+| Flag | Description |
+|---|---|
+| `--decay` | Decay factor for the `decay` effect (default: 0.92). Animatable. |
+| `--step` | Frame stride for `strobe` (default 4) and `echo` (default 1). For echo, `-n` is the window *span* and `n/step` frames are blended. Animatable. |
+| `--sigma` | Gaussian sigma for the `gaussian` effect (default: `n/4`). Smaller = sharper peak, larger = flatter. Animatable. |
+| `--anchor` | Window anchor for the `echo` effect: `1.0` = current frame is the *end* of the window (trails behind, the default), `0.0` = current frame is the *start* (trails ahead), values between shift the window proportionally. Animatable. |
 | `-q, --quality` | Quality preset for `flow-farneback`: `low`, `medium`, `high` (default: low) |
-| `--pre-eq` | Apply CLAHE histogram equalization to input frames before processing |
+
+### Pre/post-processing
+
+These work with any effect and are applied around the effect itself.
+
+| Flag | Description |
+|---|---|
+| `--pre-eq CLIP` | CLAHE histogram equalization on input frames *before* processing (clip limit, e.g. `2.0`). Expands dynamic range of the source. Animatable. |
+| `--post-eq CLIP` | CLAHE equalization *after* processing, to restore contrast lost to heavy blending (e.g. `2.0`; higher = stronger). Animatable. |
+| `--edge-preserve S` | Re-inject Sobel edges from the source frames into the processed output; strength 0.0–1.0 controls the blend. Animatable. |
+| `--edge-thickness T` | Edge line thickness for `--edge-preserve` (default: 3). Animatable. |
+| `--edge-gamma G` | Gamma applied per frame after the edge-preserve pass (only active with `--edge-preserve`). Animatable. |
+| `--gamma G` | Gamma correction after processing (>1 brightens midtones, <1 darkens). Applied after post-eq. Animatable. |
+| `--sharpen AMOUNT` | Unsharp-mask sharpen after processing (~0.5–1.5 typical). Animatable. |
+| `--sharpen-radius PX` | Gaussian blur radius for `--sharpen` (default: 3.0). Animatable. |
+| `--orig-mix FRAC` | Blend a fraction of the original frame back over the final result (0.0–1.0). Applied last, on top of everything. Animatable. |
+
+### Performance
+
+| Flag | Description |
+|---|---|
+| `--cores N` | CPU cores for shared-memory parallel processing (default: 4). Most effects are parallelized, as are `--pre-eq`/`--post-eq`. Not parallelized: `decay`, `feedback` (sequential accumulation), the optical-flow effects, and the trivially fast consecutive-frame ops (`diff`, `bitwise-xor`). |
+| `--memory MODE` | `auto` (default), `ram`, or `streaming`. See below. |
+
+#### Memory modes
+
+- **`ram`** — load every frame into memory, process, write. Fastest, but needs O(total frames) RAM.
+- **`streaming`** — lazy frame buffer with a sliding window; each output frame is written immediately. Uses O(window) memory, so arbitrarily long videos work. Does not support `--reverse` (falls back to RAM) or `--cores` (single-threaded).
+- **`auto`** — probes the video, estimates peak RAM needed, compares it to available system memory, and picks `ram` or `streaming` accordingly.
+
+## Animated parameters (kcurve)
+
+Every flag marked "Animatable" above (`-n`, `--decay`, `--step`, `--sigma`, `--anchor`, `--pre-eq`, `--post-eq`, `--edge-preserve`, `--edge-thickness`, `--edge-gamma`, `--gamma`, `--sharpen`, `--sharpen-radius`, `--orig-mix`) accepts either a plain number or a **kcurve spec** — a string that evaluates to a different value on every frame. Values are pre-computed into a per-frame array before processing, so animation works in both single-core and multicore modes.
+
+### Keyframe strings
+
+Format: `value@frame[interp]`, colon-separated. The interpolation letter controls how the curve moves *toward the next keyframe*:
+
+- `L` — linear
+- `S` — spline (Catmull-Rom, smooth through the points)
+- `B` — bezier (ease in/out)
+
+```bash
+# Echo window grows linearly from 10 frames at frame 0 to 60 at frame 200
+python3 temporal_fx.py video.mp4 -e echo -n "10@0L:60@200L"
+
+# Decay factor eases smoothly from 0.8 to 0.99
+python3 temporal_fx.py video.mp4 -e decay --decay "0.8@0L:0.99@200S"
+
+# Echo trails swing from behind the subject (anchor 1) to ahead of it (anchor 0)
+python3 temporal_fx.py video.mp4 -e echo -n 30 --anchor "1@0L:0@300L"
+
+# Pre-eq pulses: flat, spike to 4.0 at frame 290, snap back, spike again at 700
+python3 temporal_fx.py video.mp4 -e echo \
+  --pre-eq "1@1L:4.0@290S:1.0@300S:1@600S:5@700L"
+```
+
+Multiple animated parameters can be combined in one run, each with its own set of keyframes.
+
+### Math expressions
+
+Any expression using `f` as the frame number, with `sin`, `cos`, `lerp`, `clamp`, `smoothstep`, `noise`, `fbm`, `pi`, and friends:
+
+```bash
+# Echo window oscillates between 0 and 60 frames
+python3 temporal_fx.py video.mp4 -e echo -n "sin(f*0.05)*30+30"
+
+# Organic wandering sigma via fractal noise
+python3 temporal_fx.py video.mp4 -e gaussian --sigma "fbm(f*0.01)*8+2"
+```
+
+### Previewing curves
+
+Plot a curve before committing to a render:
+
+```bash
+python -m kcurve "10@0L:60@100S:10@200L"     # keyframe specs
+python -m kcurve "sin(f*0.1)*30+30" 0 200    # expressions need start/end frames
+```
 
 ## Effects
 
@@ -34,8 +133,8 @@ python3 temporal_fx.py <input_video> -e <effect> [options]
 
 | Effect | Default n | Description |
 |---|---|---|
-| `echo` | 30 | Blend previous N frames with equal weight (motion trails) |
-| `gaussian` | 30 | Gaussian-weighted blend across N frames (bell curve falloff from center) |
+| `echo` | 30 | Blend previous N frames with equal weight (motion trails). Supports `--anchor`, `--step`, `--cores` |
+| `gaussian` | 30 | Gaussian-weighted blend across N frames (bell curve falloff, see `--sigma`) |
 | `median` | 15 | Median pixel across N frames (removes moving objects) |
 | `decay` | — | Exponential persistence (use `--decay` to control) |
 | `time-ramp` | 60 | Blend window grows from 1 to N over the clip |
@@ -108,39 +207,26 @@ All three flow effects visualize motion vectors as HSV color: hue encodes direct
 - Large frames are downscaled to 640px for inference to avoid GPU memory issues
 - Uses MPS (Apple Silicon) when available, falls back to CPU on out-of-memory errors
 
-## Pre-processing
-
-The `--pre-eq` flag applies CLAHE (Contrast Limited Adaptive Histogram Equalization) to all input frames before any effect is applied. This expands the dynamic range of the source material, which can reveal detail in dark or overexposed footage. Works with any effect.
-
 ## Examples
 
 ```bash
 # Motion trails with 60-frame window
 python3 temporal_fx.py video.mp4 -e echo -n 60
 
-# Gaussian-weighted blend (smoother than echo)
-python3 temporal_fx.py video.mp4 -e gaussian -n 40
+# Multicore echo, trails ahead of the subject
+python3 temporal_fx.py video.mp4 -e echo -n 30 --anchor 0 --cores 4
+
+# Gaussian-weighted blend with explicit sigma
+python3 temporal_fx.py video.mp4 -e gaussian -n 30 --cores 4 --sigma 5.0
 
 # Remove moving objects (median)
 python3 temporal_fx.py video.mp4 -e median -n 30
 
-# Slow exponential persistence
-python3 temporal_fx.py video.mp4 -e decay --decay 0.95
+# Heavy blend, then restore contrast and edges
+python3 temporal_fx.py video.mp4 -e echo -n 60 --post-eq 2.0 --edge-preserve 0.5
 
-# Brightest with pre-equalized input
-python3 temporal_fx.py video.mp4 -e brightest -n 30 --pre-eq
-
-# Brightest with expanded dynamic range
-python3 temporal_fx.py video.mp4 -e brightest-eq -n 60
-
-# Rainbow motion trails
-python3 temporal_fx.py video.mp4 -e hue-trails -n 30
-
-# Bitwise XOR (highlights per-bit differences)
-python3 temporal_fx.py video.mp4 -e bitwise-xor
-
-# Video feedback loop
-python3 temporal_fx.py video.mp4 -e feedback
+# Force low-memory streaming for a long video
+python3 temporal_fx.py long_video.mp4 -e echo -n 60 --memory streaming
 
 # Dense optical flow comparison
 python3 temporal_fx.py video.mp4 -e flow-dis
@@ -150,6 +236,57 @@ python3 temporal_fx.py video.mp4 -e flow-raft
 # Run all effects
 python3 temporal_fx.py video.mp4 -e all
 ```
+
+---
+
+# retime.py
+
+Slow motion (or speed-up) by frame interpolation: dense optical flow is computed between each pair of frames in both directions, each frame is warped along the scaled opposing flow, and the two warps are blended so each direction fills the other's occlusion holes. Output plays at the original fps with more (or fewer) frames.
+
+```
+python3 retime.py <input_video> [options]
+```
+
+## Options
+
+| Flag | Description |
+|---|---|
+| `-o, --output` | Output path (default: `<input>_slow.mp4`) |
+| `--factor F` | Retime factor, may be fractional. `>1` slows down (`2` = 50% speed, one synthesized frame between each pair; `4` = 25% speed), `<1` speeds up (`0.5` = 200% speed). Default: 2 |
+| `--flow BACKEND` | Dense flow backend: `dis` (default — fast, CPU, no extra deps), `farneback` (classic, CPU), `raft` (AI model, best quality, needs PyTorch) |
+| `--accel-frames N` | Ease in: ramp up from a freeze over the first N *source* frames |
+| `--decel-frames N` | Ease out: ramp down to a freeze over the last N *source* frames |
+| `--max-dim PX` | Max inference dimension for RAFT (default: 640); larger frames are downscaled for flow and the flow field upscaled back |
+| `--limit N` | Only process the first N input frames (quick tests) |
+| `--hflip` | Horizontally flip frames before flow/interpolation |
+
+Notes:
+
+- With `--accel-frames`/`--decel-frames` the retime is variable-speed, so a later constant speed-up will not restore the original timing — that asymmetry is usable as an effect in itself.
+- RAFT uses MPS on Apple Silicon when available and falls back to CPU on out-of-memory.
+
+## Examples
+
+```bash
+# 50% slow motion (factor 2), DIS flow
+python3 retime.py video.mp4
+
+# 25% speed with the RAFT AI model
+python3 retime.py video.mp4 --factor 4 --flow raft
+
+# Slow down 2.66x, easing in and out of freezes over 90 frames
+python3 retime.py video.mp4 --factor 2.66 --accel-frames 90 --decel-frames 90
+
+# Speed back up by the same factor
+python3 retime.py video_slow.mp4 --factor 0.376 -o video_restored.mp4
+
+# Round-trip with a temporal effect in the middle:
+python3 retime.py video.mp4 --factor 2.66 -o slow.mp4
+python3 temporal_fx.py slow.mp4 -e echo -n 30 --anchor "1@0L:0@300L" -o slow_echo.mp4
+python3 retime.py slow_echo.mp4 --factor 0.376 -o final.mp4
+```
+
+---
 
 ## Output
 
